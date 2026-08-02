@@ -151,6 +151,16 @@ public struct StreamGateReport: Sendable {
     public var streaming: Bool  // the decision
 }
 
+/// How bind-time residents relate to the model's load semantics.
+public enum ResidentCastPolicy: Sendable {
+    /// Load raw granule bytes (consumers that never cast at load — wan-core).
+    /// Partition then keeps every ≥-threshold tensor streamed regardless of dtype.
+    case none
+    /// Cast plain (non-quant) params to computeDtype, exactly as a resident
+    /// `init` would (ltx-2's DiT.init semantics); such tensors residentize.
+    case castPlainParams
+}
+
 /// One block's parameter arrays as bound by the kit: slot-backed streamed
 /// tensors + bind-time residents, keys RELATIVE to the block (manifest keys).
 /// The consumer maps them onto its model however it stores weights.
@@ -173,8 +183,13 @@ public final class BlockStreamer: @unchecked Sendable {
 
     // Immutable layout after init.
     public let options: BlockStreamingOptions
-    public let granuleDir: URL
-    public let manifest: GranuleManifest
+    /// One granule directory per SET (dense models pass one; multi-expert
+    /// models pass one per expert — sets share the slots, and exactly one
+    /// set's IO is active at a time; `ensureActive(set:)` switches).
+    public let granuleDirs: [URL]
+    public let manifests: [GranuleManifest]
+    public var granuleDir: URL { granuleDirs[0] }
+    public var manifest: GranuleManifest { manifests[0] }
     public let blockCount: Int
     public let groupSize: Int
     public let numGroups: Int
@@ -199,9 +214,11 @@ public final class BlockStreamer: @unchecked Sendable {
     private var slotPtrs: [[UnsafeMutableRawPointer]] = []
 
     // Consumer seams, stored at bind: how to install resident arrays on
-    // fallback, and how to detach the model's loop routing.
-    private var installResident: ((Int, [(String, MLXArray)]) throws -> Void)?
+    // fallback (set, block, pairs), and how to detach the model's loop routing.
+    private var installResident: ((Int, Int, [(String, MLXArray)]) throws -> Void)?
     private var onDetach: (() -> Void)?
+    /// The granule set whose IO is (or was last) active. -1 before first activation.
+    public private(set) var activeSet = -1
 
     private final class IOState: @unchecked Sendable {
         struct Refill {
@@ -297,14 +314,32 @@ public final class BlockStreamer: @unchecked Sendable {
 
     // MARK: - Init / bind
 
-    public init(granuleDir: URL, options: BlockStreamingOptions = .init()) throws {
+    public convenience init(granuleDir: URL, options: BlockStreamingOptions = .init()) throws {
+        try self.init(granuleDirs: [granuleDir], options: options)
+    }
+
+    public init(granuleDirs: [URL], options: BlockStreamingOptions = .init()) throws {
+        guard !granuleDirs.isEmpty else {
+            throw BlockStreamError.contract("no granule directories")
+        }
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw BlockStreamError.noMetalDevice
         }
         self.device = device
         self.options = options
-        self.granuleDir = granuleDir
-        self.manifest = try GranuleManifest.load(from: granuleDir)
+        self.granuleDirs = granuleDirs
+        self.manifests = try granuleDirs.map { try GranuleManifest.load(from: $0) }
+        // Sets share slots, so every manifest must describe the identical layout.
+        let first = manifests[0]
+        for m in manifests.dropFirst() {
+            let a = first.blocks[0].tensors.map { "\($0.key)|\($0.dtype)|\($0.shape)" }
+            let b = m.blocks[0].tensors.map { "\($0.key)|\($0.dtype)|\($0.shape)" }
+            guard m.blockCount == first.blockCount, a == b else {
+                throw BlockStreamError.contract(
+                    "granule sets differ in layout — cannot share slots")
+            }
+        }
+        let manifest = first
 
         self.blockCount = manifest.blockCount
         self.groupSize = options.groupSize
@@ -339,17 +374,39 @@ public final class BlockStreamer: @unchecked Sendable {
     /// After installing, the consumer MUST call `verifyInstalled(lookup:)` —
     /// an install that copied instead of aliasing would read stale slots
     /// forever and no forward would ever crash.
+    /// Single-set convenience (dense models): see `bind(computeDtype:castPolicy:...)`.
     public func bind(
         computeDtype: DType,
         provenanceCheckpoint: URL? = nil,
         installResident: @escaping (Int, [(String, MLXArray)]) throws -> Void,
         onDetach: @escaping () -> Void
     ) throws -> [BoundBlockArrays] {
+        let perSet = try bind(
+            computeDtype: computeDtype, castPolicy: .castPlainParams,
+            provenanceCheckpoints: provenanceCheckpoint.map { [$0] },
+            installResident: { _, block, pairs in try installResident(block, pairs) },
+            onDetach: onDetach)
+        return perSet[0]
+    }
+
+    public func bind(
+        computeDtype: DType,
+        castPolicy: ResidentCastPolicy,
+        provenanceCheckpoints: [URL]? = nil,
+        installResident: @escaping (Int, Int, [(String, MLXArray)]) throws -> Void,
+        onDetach: @escaping () -> Void
+    ) throws -> [[BoundBlockArrays]] {
         guard slotArrays.isEmpty else {
             throw BlockStreamError.state("bind() called twice")
         }
-        if let checkpoint = provenanceCheckpoint {
-            try manifest.validateProvenance(against: checkpoint)
+        if let checkpoints = provenanceCheckpoints {
+            guard checkpoints.count == manifests.count else {
+                throw BlockStreamError.contract(
+                    "\(checkpoints.count) provenance checkpoints vs \(manifests.count) sets")
+            }
+            for (m, c) in zip(manifests, checkpoints) {
+                try m.validateProvenance(against: c)
+            }
         }
         boundComputeDtype = computeDtype
         self.installResident = installResident
@@ -366,7 +423,8 @@ public final class BlockStreamer: @unchecked Sendable {
         var resident: [GranuleTensor] = []
         for t in allTemplate {
             let raw = try mlxDType(safetensors: t.dtype)
-            let usableAsIs = raw == computeDtype || isQuantComponent(t.key)
+            let usableAsIs =
+                castPolicy == .none || raw == computeDtype || isQuantComponent(t.key)
             if t.nbytes >= Self.smallTensorResidentBytes, usableAsIs {
                 streamed.append(t)
             } else {
@@ -411,38 +469,47 @@ public final class BlockStreamer: @unchecked Sendable {
             slotPtrs.append(ptrs)
         }
 
-        // Per-block array sets: slot-backed streamed + copied residents (cast).
-        var out: [BoundBlockArrays] = []
+        // Per-set, per-block array sets: slot-backed streamed tensors are
+        // SHARED across sets (block i of every set aliases the same slot
+        // array); bind-time residents are per-set values.
+        var out: [[BoundBlockArrays]] = []
         var blockResidentBytes = 0
-        for block in manifest.blocks {
-            let i = block.index
-            let slot = (i / groupSize) % 2
-            let base = (i % groupSize) * tensorsPerBlock
-            var arrays: [(String, MLXArray)] = []
-            for (t, entry) in template.enumerated() {
-                arrays.append((entry.key, slotArrays[slot][base + t]))
-            }
-            if !residentTemplate.isEmpty {
-                let fd = try GranuleIO.openRead(
-                    granuleDir.appendingPathComponent(block.file).path, noCache: false)
-                defer { close(fd) }
-                for t in block.tensors where !streamedKeys.contains(t.key) {
-                    var bytes = Data(count: t.nbytes)
-                    try bytes.withUnsafeMutableBytes { raw in
-                        try GranuleIO.preadFull(
-                            fd: fd, into: raw.baseAddress!, count: t.nbytes, offset: t.offset)
-                    }
-                    let raw = try mlxDType(safetensors: t.dtype)
-                    var a = MLXArray(bytes, t.shape, dtype: raw)
-                    if !isQuantComponent(t.key), raw != computeDtype {
-                        a = a.asType(computeDtype)
-                    }
-                    eval(a)
-                    arrays.append((t.key, a))
-                    blockResidentBytes += t.nbytes
+        for (setIndex, setManifest) in manifests.enumerated() {
+            var setOut: [BoundBlockArrays] = []
+            for block in setManifest.blocks {
+                let i = block.index
+                let slot = (i / groupSize) % 2
+                let base = (i % groupSize) * tensorsPerBlock
+                var arrays: [(String, MLXArray)] = []
+                for (t, entry) in template.enumerated() {
+                    arrays.append((entry.key, slotArrays[slot][base + t]))
                 }
+                if !residentTemplate.isEmpty {
+                    let fd = try GranuleIO.openRead(
+                        granuleDirs[setIndex].appendingPathComponent(block.file).path,
+                        noCache: false)
+                    defer { close(fd) }
+                    for t in block.tensors where !streamedKeys.contains(t.key) {
+                        var bytes = Data(count: t.nbytes)
+                        try bytes.withUnsafeMutableBytes { raw in
+                            try GranuleIO.preadFull(
+                                fd: fd, into: raw.baseAddress!, count: t.nbytes, offset: t.offset)
+                        }
+                        let raw = try mlxDType(safetensors: t.dtype)
+                        var a = MLXArray(bytes, t.shape, dtype: raw)
+                        if castPolicy == .castPlainParams, !isQuantComponent(t.key),
+                            raw != computeDtype
+                        {
+                            a = a.asType(computeDtype)
+                        }
+                        eval(a)
+                        arrays.append((t.key, a))
+                        blockResidentBytes += t.nbytes
+                    }
+                }
+                setOut.append(BoundBlockArrays(block: i, arrays: arrays))
             }
-            out.append(BoundBlockArrays(block: i, arrays: arrays))
+            out.append(setOut)
         }
 
         lock.lock()
@@ -463,13 +530,25 @@ public final class BlockStreamer: @unchecked Sendable {
     /// every streamed key of every block, as the model will actually read it,
     /// must alias the exact recorded slot pointer.
     public func verifyInstalled(lookup: (Int, String) throws -> MLXArray?) throws {
+        try verifyInstalledSets { _, i, key in try lookup(i, key) }
+    }
+
+    /// Multi-set: (set, block, key) — the SAME slot pointers must be reachable
+    /// through every set's installed storage.
+    public func verifyInstalledSets(lookup: (Int, Int, String) throws -> MLXArray?) throws {
+        for setIndex in 0..<manifests.count {
+            try verifySet(setIndex, lookup: lookup)
+        }
+    }
+
+    private func verifySet(_ setIndex: Int, lookup: (Int, Int, String) throws -> MLXArray?) throws {
         for i in 0..<blockCount {
             let slot = (i / groupSize) % 2
             let base = (i % groupSize) * tensorsPerBlock
             for (t, entry) in template.enumerated() {
-                guard let a = try lookup(i, entry.key) else {
+                guard let a = try lookup(setIndex, i, entry.key) else {
                     throw BlockStreamError.contract(
-                        "consumer lookup returned nil for block \(i) \(entry.key)")
+                        "consumer lookup returned nil for set \(setIndex) block \(i) \(entry.key)")
                 }
                 let ptr = try backingPointer(a, context: "\(entry.key) post-install")
                 guard ptr == slotPtrs[slot][base + t] else {
@@ -481,19 +560,27 @@ public final class BlockStreamer: @unchecked Sendable {
 
     // MARK: - Activation and the IO thread
 
-    /// (Re)start the prefetch thread at group 0. Idempotent while IO is live.
-    /// PUBLIC: consumers with more than one granule set (expert switching)
-    /// stop one streamer and activate another; plain consumers just let the
-    /// streamed forward call it.
+    /// (Re)start the prefetch thread at group 0 for set 0 (dense models).
+    /// Idempotent while that set's IO is live.
     public func ensureActive() {
-        if io != nil { return }
-        startIO()
+        ensureActive(set: 0)
     }
 
-    private func startIO() {
+    /// Make `set`'s granule files the streamed source, (re)starting the
+    /// prefetch thread at group 0. Switching sets (an expert boundary) stops
+    /// the old thread and starts the new one; same-set calls are idempotent.
+    public func ensureActive(set: Int) {
+        if set == activeSet, io != nil { return }
+        stopIO()
+        startIO(set: set)
+    }
+
+    private func startIO(set: Int) {
         precondition(io == nil)
-        let fds: [Int32] = manifest.blocks.map { block in
-            let path = granuleDir.appendingPathComponent(block.file).path
+        let setManifest = manifests[set]
+        let setDir = granuleDirs[set]
+        let fds: [Int32] = setManifest.blocks.map { block in
+            let path = setDir.appendingPathComponent(block.file).path
             guard let fd = try? GranuleIO.openRead(path) else {
                 fatalError("BlockStreamer: cannot open granule \(path)")
             }
@@ -506,7 +593,7 @@ public final class BlockStreamer: @unchecked Sendable {
                 var refills: [IOState.Refill] = []
                 for lb in 0..<groupSize {
                     let bi = g * groupSize + lb
-                    let streamed = manifest.blocks[bi].tensors.filter {
+                    let streamed = setManifest.blocks[bi].tensors.filter {
                         streamedKeys.contains($0.key)
                     }
                     for (t, entry) in streamed.enumerated() {
@@ -524,6 +611,7 @@ public final class BlockStreamer: @unchecked Sendable {
         }
         let state = IOState(fds: fds, plan: plan)
         io = state
+        activeSet = set
         computeSeq = 0
 
         let numGroups = self.numGroups
@@ -561,7 +649,7 @@ public final class BlockStreamer: @unchecked Sendable {
         thread.name = "BlockStreamKit.io"
         thread.qualityOfService = .userInitiated
         thread.start()
-        say("streaming from \(granuleDir.lastPathComponent)")
+        say("streaming set \(set) from \(setDir.lastPathComponent)")
     }
 
     private func stopIO() {
@@ -692,9 +780,10 @@ public final class BlockStreamer: @unchecked Sendable {
         let t0 = CFAbsoluteTimeGetCurrent()
         var loadedBytes = 0
         let keySet = Set(allTemplate.map(\.key))
-        for (i, granule) in manifest.blocks.enumerated() {
+        for setIndex in 0..<manifests.count {
+        for (i, granule) in manifests[setIndex].blocks.enumerated() {
             let fd = try GranuleIO.openRead(
-                granuleDir.appendingPathComponent(granule.file).path)
+                granuleDirs[setIndex].appendingPathComponent(granule.file).path)
             defer { close(fd) }
             var pairs: [(String, MLXArray)] = []
             var arrays: [MLXArray] = []
@@ -718,7 +807,8 @@ public final class BlockStreamer: @unchecked Sendable {
                 loadedBytes += t.nbytes
             }
             eval(arrays)
-            try install(i, pairs)
+            try install(setIndex, i, pairs)
+        }
         }
         let dt = CFAbsoluteTimeGetCurrent() - t0
         say(String(
