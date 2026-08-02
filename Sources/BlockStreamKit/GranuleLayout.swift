@@ -15,6 +15,7 @@
 // the UBC on layout, and honest-cold streaming receipts depend on granules
 // never entering the page cache (the prototype's cold-number recipe).
 
+import CryptoKit
 import Foundation
 
 public enum GranuleLayoutError: LocalizedError {
@@ -107,9 +108,23 @@ public struct GranuleBlock: Codable, Sendable {
     public let file: String  // relative to the manifest's directory
     public let bytes: Int  // granule file size (offsets + padding included)
     public let tensors: [GranuleTensor]
+    /// SHA-256 of the granule file (manifest v2; nil on v1 trees). The
+    /// integrity authority for HOSTED trees, where the source checkpoint —
+    /// v1's provenance anchor — is not on the consumer's machine.
+    public let sha256: String?
 
     enum CodingKeys: String, CodingKey {
-        case index, file, bytes, tensors
+        case index, file, bytes, tensors, sha256
+    }
+
+    public init(
+        index: Int, file: String, bytes: Int, tensors: [GranuleTensor], sha256: String? = nil
+    ) {
+        self.index = index
+        self.file = file
+        self.bytes = bytes
+        self.tensors = tensors
+        self.sha256 = sha256
     }
 }
 
@@ -130,6 +145,13 @@ public struct GranuleManifest: Codable, Sendable {
     /// Keys in the source safetensors that are NOT per-block (patchify, adaln
     /// singles, output heads, …) — loaded resident by the consumer.
     public let globalKeys: [String]
+    /// Manifest v2: the globals SIDECAR — the non-block tensors serialized in
+    /// the granule format itself (`globals.granule`, offsets + sha256 like any
+    /// block, `index == -1`). Makes a tree SELF-CONTAINED: a consumer without
+    /// the source checkpoint loads globals from here, and integrity comes from
+    /// the hashes instead of source-file provenance. nil on v1 trees (which
+    /// keep loading globals from the checkpoint).
+    public let globals: GranuleBlock?
 
     enum CodingKeys: String, CodingKey {
         case version
@@ -141,10 +163,16 @@ public struct GranuleManifest: Codable, Sendable {
         case streamedBytes = "streamed_bytes"
         case blocks
         case globalKeys = "global_keys"
+        case globals
     }
 
-    public static let currentVersion = 1
+    public static let currentVersion = 2
+    /// Oldest manifest version the loader accepts (v1 trees — no sidecar, no
+    /// hashes — remain fully streamable; only the checkpoint-free and
+    /// integrity paths need v2).
+    public static let minimumVersion = 1
     public static let manifestFileName = "manifest.json"
+    public static let globalsFileName = "globals.granule"
 
     public static func load(from dir: URL) throws -> GranuleManifest {
         let url = dir.appendingPathComponent(manifestFileName)
@@ -156,9 +184,9 @@ public struct GranuleManifest: Codable, Sendable {
             throw GranuleLayoutError.badManifest(
                 "\(url.path): \(error.localizedDescription)")
         }
-        guard manifest.version == currentVersion else {
+        guard manifest.version >= minimumVersion, manifest.version <= currentVersion else {
             throw GranuleLayoutError.badManifest(
-                "version \(manifest.version) != \(currentVersion)")
+                "version \(manifest.version) outside supported \(minimumVersion)...\(currentVersion)")
         }
         guard manifest.blocks.count == manifest.blockCount else {
             throw GranuleLayoutError.badManifest(
@@ -311,51 +339,74 @@ public enum GranuleLayout {
         var writtenBytes = 0
         let align = GranuleIO.alignment
 
-        for b in 0..<blockCount {
-            let ordered = perBlock[b]!.sorted {
-                (orderRank($0.suffix), $0.suffix) < (orderRank($1.suffix), $1.suffix)
-            }
-            let fileName = String(format: "block_%03d.granule", b)
+        /// Copy one granule file (tensors in the given order, 16 KiB-aligned
+        /// offsets, zero-padded), hashing every written byte — padding
+        /// included, so the manifest hash covers the file verbatim.
+        func writeGranule(
+            fileName: String, ordered: [(key: String, entry: SafetensorsTensorEntry)],
+            index: Int
+        ) throws -> GranuleBlock {
             let dstPath = outputDir.appendingPathComponent(fileName).path
             let dstFd = open(dstPath, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
             guard dstFd >= 0 else {
                 throw GranuleLayoutError.io("create \(dstPath) errno \(errno)")
             }
             _ = fcntl(dstFd, F_NOCACHE, 1)
+            defer { close(dstFd) }
 
+            var hasher = SHA256()
             var tensors: [GranuleTensor] = []
             var cursor = 0
-            for (suffix, entry) in ordered {
-                // Copy tensor bytes, then zero-pad the file to the next 16 KiB
-                // boundary so the NEXT tensor's offset is aligned.
+            for (key, entry) in ordered {
                 var remaining = entry.nbytes
                 var srcOff = header.dataStart + entry.start
                 while remaining > 0 {
                     let n = min(bufBytes, remaining)
                     try GranuleIO.preadFull(fd: srcFd, into: buf, count: n, offset: srcOff)
                     try GranuleIO.writeFull(fd: dstFd, from: buf, count: n)
+                    hasher.update(bufferPointer: UnsafeRawBufferPointer(start: buf, count: n))
                     srcOff += n
                     remaining -= n
                 }
                 tensors.append(
                     GranuleTensor(
-                        key: suffix, dtype: entry.dtype, shape: entry.shape,
+                        key: key, dtype: entry.dtype, shape: entry.shape,
                         offset: cursor, nbytes: entry.nbytes))
-                streamedBytes += entry.nbytes
                 cursor += entry.nbytes
                 let padded = (cursor + align - 1) / align * align
                 if padded > cursor {
                     memset(buf, 0, padded - cursor)
                     try GranuleIO.writeFull(fd: dstFd, from: buf, count: padded - cursor)
+                    hasher.update(
+                        bufferPointer: UnsafeRawBufferPointer(start: buf, count: padded - cursor))
                     cursor = padded
                 }
             }
-            close(dstFd)
             writtenBytes += cursor
-            blocks.append(
-                GranuleBlock(index: b, file: fileName, bytes: cursor, tensors: tensors))
+            let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+            return GranuleBlock(
+                index: index, file: fileName, bytes: cursor, tensors: tensors, sha256: digest)
+        }
+
+        for b in 0..<blockCount {
+            let ordered = perBlock[b]!
+                .sorted { (orderRank($0.suffix), $0.suffix) < (orderRank($1.suffix), $1.suffix) }
+                .map { (key: $0.suffix, entry: $0.entry) }
+            let block = try writeGranule(
+                fileName: String(format: "block_%03d.granule", b), ordered: ordered, index: b)
+            streamedBytes += block.tensors.reduce(0) { $0 + $1.nbytes }
+            blocks.append(block)
             progress?(b + 1, blockCount)
         }
+
+        // The globals SIDECAR (manifest v2): every non-block tensor, key order
+        // deterministic, FULL on-disk key names preserved (consumers apply
+        // their own dialect strip). Makes the tree self-contained — a hosted
+        // tree needs no source checkpoint.
+        let globalsBlock = try writeGranule(
+            fileName: GranuleManifest.globalsFileName,
+            ordered: globalKeys.sorted().map { (key: $0, entry: header.tensors[$0]!) },
+            index: -1)
 
         let sourceSize =
             (try? FileManager.default.attributesOfItem(atPath: safetensors.path)[.size] as? Int)
@@ -369,7 +420,8 @@ public enum GranuleLayout {
             blockCount: blockCount,
             streamedBytes: streamedBytes,
             blocks: blocks,
-            globalKeys: globalKeys.sorted())
+            globalKeys: globalKeys.sorted(),
+            globals: globalsBlock)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         try encoder.encode(manifest).write(

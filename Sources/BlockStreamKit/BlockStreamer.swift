@@ -47,6 +47,7 @@
 // is the resident path's own measured repeat band — always paired with the
 // poisoned-slot negative control so the compare keeps teeth.
 
+import CryptoKit
 import Foundation
 import MLX
 import Metal
@@ -823,6 +824,77 @@ public final class BlockStreamer: @unchecked Sendable {
         lock.lock()
         _verdict = .fellBack
         lock.unlock()
+    }
+
+    // MARK: - Manifest v2: integrity + sidecar globals
+
+    /// Recompute every granule file's SHA-256 (globals sidecar included) and
+    /// compare against the manifest — the post-download check for HOSTED trees,
+    /// where v1's source-checkpoint provenance anchor doesn't exist. Reads the
+    /// full tree; call it once after materialization, not per launch. Throws on
+    /// any mismatch, and on v1 trees (no hashes recorded).
+    public func verifyIntegrity() throws {
+        let bufBytes = 32 << 20
+        var bufRaw: UnsafeMutableRawPointer? = nil
+        guard posix_memalign(&bufRaw, 16384, bufBytes) == 0, let buf = bufRaw else {
+            throw BlockStreamError.state("posix_memalign failed")
+        }
+        defer { free(buf) }
+
+        for (setIndex, m) in manifests.enumerated() {
+            var files = m.blocks
+            if let g = m.globals { files.append(g) }
+            for granule in files {
+                guard let expected = granule.sha256 else {
+                    throw BlockStreamError.contract(
+                        "set \(setIndex) \(granule.file) has no sha256 — v1 tree; "
+                            + "re-lay with a v2 kit for integrity verification")
+                }
+                let path = granuleDirs[setIndex].appendingPathComponent(granule.file).path
+                let fd = try GranuleIO.openRead(path)
+                defer { close(fd) }
+                var hasher = SHA256()
+                var offset = 0
+                while offset < granule.bytes {
+                    let n = min(bufBytes, granule.bytes - offset)
+                    try GranuleIO.preadFull(fd: fd, into: buf, count: n, offset: offset)
+                    hasher.update(bufferPointer: UnsafeRawBufferPointer(start: buf, count: n))
+                    offset += n
+                }
+                let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+                guard digest == expected else {
+                    throw BlockStreamError.contract(
+                        "set \(setIndex) \(granule.file) hash mismatch — corrupt or "
+                            + "tampered tree (expected \(expected.prefix(12))…, "
+                            + "got \(digest.prefix(12))…)")
+                }
+            }
+        }
+    }
+
+    /// Load the globals SIDECAR of a v2 tree as raw arrays (COPYING
+    /// constructor, granule dtypes verbatim — the consumer applies its own
+    /// dialect strip and cast). Keys are the FULL on-disk names.
+    public func loadGlobalTensors(set: Int = 0) throws -> [(key: String, array: MLXArray)] {
+        guard let g = manifests[set].globals else {
+            throw BlockStreamError.contract(
+                "no globals sidecar in set \(set) — v1 tree; load globals from the "
+                    + "source checkpoint or re-lay with a v2 kit")
+        }
+        let fd = try GranuleIO.openRead(
+            granuleDirs[set].appendingPathComponent(g.file).path, noCache: false)
+        defer { close(fd) }
+        var out: [(String, MLXArray)] = []
+        for t in g.tensors {
+            var bytes = Data(count: t.nbytes)
+            try bytes.withUnsafeMutableBytes { raw in
+                try GranuleIO.preadFull(
+                    fd: fd, into: raw.baseAddress!, count: t.nbytes, offset: t.offset)
+            }
+            let a = MLXArray(bytes, t.shape, dtype: try mlxDType(safetensors: t.dtype))
+            out.append((t.key, a))
+        }
+        return out
     }
 
     // MARK: - Test / receipt hooks
