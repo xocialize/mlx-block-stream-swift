@@ -201,6 +201,7 @@ public final class BlockStreamer: @unchecked Sendable {
     private var streamedKeys: Set<String> = []
     private(set) var tensorsPerBlock = 0
     private var boundComputeDtype: DType = .bfloat16
+    private var boundCastPolicy: ResidentCastPolicy = .castPlainParams
     /// Raw streamed bytes per full sweep (bind-time residents excluded).
     public private(set) var sweepBytes = 0
     /// Resident slot footprint: 2 slots × groupSize blocks of parameters.
@@ -409,6 +410,7 @@ public final class BlockStreamer: @unchecked Sendable {
             }
         }
         boundComputeDtype = computeDtype
+        boundCastPolicy = castPolicy
         self.installResident = installResident
         self.onDetach = onDetach
 
@@ -799,7 +801,9 @@ public final class BlockStreamer: @unchecked Sendable {
                     t.key.hasSuffix(".scales") || t.key.hasSuffix(".biases")
                     || (t.key.hasSuffix(".weight")
                         && keySet.contains(String(t.key.dropLast("weight".count)) + "scales"))
-                if !quantComponent, raw != boundComputeDtype {
+                if boundCastPolicy == .castPlainParams, !quantComponent,
+                    raw != boundComputeDtype
+                {
                     a = a.asType(boundComputeDtype)
                 }
                 pairs.append((t.key, a))
