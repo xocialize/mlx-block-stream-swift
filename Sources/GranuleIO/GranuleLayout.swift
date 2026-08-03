@@ -227,21 +227,33 @@ public struct GranuleManifest: Codable, Sendable {
     }
 }
 
-// MARK: - Raw file IO helpers (shared with the streamer)
+// MARK: - Raw file IO helpers (the substrate: layout writer, streamer refills, spill files)
 
-enum GranuleIO {
-    static let alignment = 16384
+/// Raw F_NOCACHE file IO. Public since the `GranuleIO` product split (a type may
+/// not share its module's name, hence `GranuleFileIO`): activation-spill
+/// consumers need exactly this layer without the streamer.
+public enum GranuleFileIO {
+    public static let alignment = 16384
 
-    static func openRead(_ path: String, noCache: Bool = true) throws -> Int32 {
+    public static func openRead(_ path: String, noCache: Bool = true) throws -> Int32 {
         let fd = open(path, O_RDONLY)
         guard fd >= 0 else { throw GranuleLayoutError.io("open(\(path)) errno \(errno)") }
         if noCache { _ = fcntl(fd, F_NOCACHE, 1) }
         return fd
     }
 
-    static func preadFull(fd: Int32, into dst: UnsafeMutableRawPointer, count: Int, offset: Int)
-        throws
-    {
+    /// Create/truncate for writing. Same F_NOCACHE default as reads — spill and
+    /// granule traffic is multi-GiB and transient, and must not flush the UBC.
+    public static func openWrite(_ path: String, noCache: Bool = true) throws -> Int32 {
+        let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+        guard fd >= 0 else { throw GranuleLayoutError.io("create \(path) errno \(errno)") }
+        if noCache { _ = fcntl(fd, F_NOCACHE, 1) }
+        return fd
+    }
+
+    public static func preadFull(
+        fd: Int32, into dst: UnsafeMutableRawPointer, count: Int, offset: Int
+    ) throws {
         var done = 0
         while done < count {
             let n = pread(fd, dst + done, min(32 << 20, count - done), off_t(offset + done))
@@ -252,7 +264,7 @@ enum GranuleIO {
         }
     }
 
-    static func writeFull(fd: Int32, from src: UnsafeRawPointer, count: Int) throws {
+    public static func writeFull(fd: Int32, from src: UnsafeRawPointer, count: Int) throws {
         var done = 0
         while done < count {
             let n = write(fd, src + done, min(32 << 20, count - done))
@@ -324,20 +336,20 @@ public enum GranuleLayout {
         try FileManager.default.createDirectory(
             at: outputDir, withIntermediateDirectories: true)
 
-        let srcFd = try GranuleIO.openRead(safetensors.path)
+        let srcFd = try GranuleFileIO.openRead(safetensors.path)
         defer { close(srcFd) }
 
         // Page-aligned bounce buffer for F_NOCACHE-friendly copies.
         let bufBytes = 32 << 20
         var bufRaw: UnsafeMutableRawPointer? = nil
-        guard posix_memalign(&bufRaw, GranuleIO.alignment, bufBytes) == 0, let buf = bufRaw
+        guard posix_memalign(&bufRaw, GranuleFileIO.alignment, bufBytes) == 0, let buf = bufRaw
         else { throw GranuleLayoutError.io("posix_memalign failed") }
         defer { free(buf) }
 
         var blocks: [GranuleBlock] = []
         var streamedBytes = 0
         var writtenBytes = 0
-        let align = GranuleIO.alignment
+        let align = GranuleFileIO.alignment
 
         /// Copy one granule file (tensors in the given order, 16 KiB-aligned
         /// offsets, zero-padded), hashing every written byte — padding
@@ -362,8 +374,8 @@ public enum GranuleLayout {
                 var srcOff = header.dataStart + entry.start
                 while remaining > 0 {
                     let n = min(bufBytes, remaining)
-                    try GranuleIO.preadFull(fd: srcFd, into: buf, count: n, offset: srcOff)
-                    try GranuleIO.writeFull(fd: dstFd, from: buf, count: n)
+                    try GranuleFileIO.preadFull(fd: srcFd, into: buf, count: n, offset: srcOff)
+                    try GranuleFileIO.writeFull(fd: dstFd, from: buf, count: n)
                     hasher.update(bufferPointer: UnsafeRawBufferPointer(start: buf, count: n))
                     srcOff += n
                     remaining -= n
@@ -376,7 +388,7 @@ public enum GranuleLayout {
                 let padded = (cursor + align - 1) / align * align
                 if padded > cursor {
                     memset(buf, 0, padded - cursor)
-                    try GranuleIO.writeFull(fd: dstFd, from: buf, count: padded - cursor)
+                    try GranuleFileIO.writeFull(fd: dstFd, from: buf, count: padded - cursor)
                     hasher.update(
                         bufferPointer: UnsafeRawBufferPointer(start: buf, count: padded - cursor))
                     cursor = padded

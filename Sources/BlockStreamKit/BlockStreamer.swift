@@ -53,6 +53,12 @@ import MLX
 import Metal
 import os
 
+// The IO substrate (granule layout/manifest, raw F_NOCACHE IO, dtype bridge,
+// P-C alias seam, spill files) moved to the `GranuleIO` product so activation
+// spill/refill consumers can take it without the streamer. Re-exported here so
+// `import BlockStreamKit` keeps meaning what it always meant.
+@_exported import GranuleIO
+
 public enum BlockStreamError: LocalizedError {
     case noMetalDevice
     case aliasUnavailable(String)
@@ -73,41 +79,9 @@ public enum BlockStreamError: LocalizedError {
     }
 }
 
-/// Safetensors dtype string → MLX DType (the subset block checkpoints use).
-func mlxDType(safetensors dtype: String) throws -> DType {
-    switch dtype {
-    case "BF16": return .bfloat16
-    case "F16": return .float16
-    case "F32": return .float32
-    case "U32": return .uint32
-    case "U8": return .uint8
-    case "I32": return .int32
-    case "I64": return .int64
-    default:
-        throw BlockStreamError.contract("unsupported safetensors dtype \(dtype)")
-    }
-}
-
-/// The raw backing pointer of an evaluated, contiguous MLXArray — the P-C alias
-/// seam. A silent copy (non-contiguous backing) is detected by double
-/// extraction: a wrapper returns the same address twice, a copy cannot.
-/// (⚠️ NOT sufficient for ≤14-byte tensors — Data's inline storage can reuse
-/// the same stack slot across identical calls; that's why sub-threshold
-/// tensors never go through this path at all.)
-func backingPointer(_ a: MLXArray, context: @autoclosure () -> String) throws
-    -> UnsafeMutableRawPointer
-{
-    func extract() -> UnsafeMutableRawPointer? {
-        let d = a.asData(access: .noCopyIfContiguous)
-        return d.data.withUnsafeBytes { raw in
-            raw.baseAddress.map { UnsafeMutableRawPointer(mutating: $0) }
-        }
-    }
-    guard let p1 = extract(), let p2 = extract(), p1 == p2 else {
-        throw BlockStreamError.aliasUnavailable(context())
-    }
-    return p1
-}
+// `mlxDType(safetensors:)` and `backingPointer(_:context:)` live in GranuleIO
+// now (they throw `GranuleIOError` instead of `BlockStreamError` — same
+// messages, same conditions).
 
 /// Opt-in configuration for block streaming (consumer-constructed, per config).
 public struct BlockStreamingOptions: Sendable {
@@ -180,7 +154,7 @@ public final class BlockStreamer: @unchecked Sendable {
 
     /// Tensors smaller than this stay RESIDENT (loaded once per block at bind)
     /// instead of slot-backed — the Data-inlining trap plus syscall economy.
-    public static let smallTensorResidentBytes = 256
+    public static let smallTensorResidentBytes = granuleSmallTensorBytes
 
     // Immutable layout after init.
     public let options: BlockStreamingOptions
@@ -488,14 +462,14 @@ public final class BlockStreamer: @unchecked Sendable {
                     arrays.append((entry.key, slotArrays[slot][base + t]))
                 }
                 if !residentTemplate.isEmpty {
-                    let fd = try GranuleIO.openRead(
+                    let fd = try GranuleFileIO.openRead(
                         granuleDirs[setIndex].appendingPathComponent(block.file).path,
                         noCache: false)
                     defer { close(fd) }
                     for t in block.tensors where !streamedKeys.contains(t.key) {
                         var bytes = Data(count: t.nbytes)
                         try bytes.withUnsafeMutableBytes { raw in
-                            try GranuleIO.preadFull(
+                            try GranuleFileIO.preadFull(
                                 fd: fd, into: raw.baseAddress!, count: t.nbytes, offset: t.offset)
                         }
                         let raw = try mlxDType(safetensors: t.dtype)
@@ -584,7 +558,7 @@ public final class BlockStreamer: @unchecked Sendable {
         let setDir = granuleDirs[set]
         let fds: [Int32] = setManifest.blocks.map { block in
             let path = setDir.appendingPathComponent(block.file).path
-            guard let fd = try? GranuleIO.openRead(path) else {
+            guard let fd = try? GranuleFileIO.openRead(path) else {
                 fatalError("BlockStreamer: cannot open granule \(path)")
             }
             return fd
@@ -629,7 +603,7 @@ public final class BlockStreamer: @unchecked Sendable {
                 var bytes = 0
                 for refill in state.plan[slot][g] {
                     do {
-                        try GranuleIO.preadFull(
+                        try GranuleFileIO.preadFull(
                             fd: refill.fd, into: refill.dst,
                             count: refill.nbytes, offset: refill.offset)
                     } catch {
@@ -785,7 +759,7 @@ public final class BlockStreamer: @unchecked Sendable {
         let keySet = Set(allTemplate.map(\.key))
         for setIndex in 0..<manifests.count {
         for (i, granule) in manifests[setIndex].blocks.enumerated() {
-            let fd = try GranuleIO.openRead(
+            let fd = try GranuleFileIO.openRead(
                 granuleDirs[setIndex].appendingPathComponent(granule.file).path)
             defer { close(fd) }
             var pairs: [(String, MLXArray)] = []
@@ -793,7 +767,7 @@ public final class BlockStreamer: @unchecked Sendable {
             for t in granule.tensors {
                 var bytes = Data(count: t.nbytes)
                 try bytes.withUnsafeMutableBytes { raw in
-                    try GranuleIO.preadFull(
+                    try GranuleFileIO.preadFull(
                         fd: fd, into: raw.baseAddress!, count: t.nbytes, offset: t.offset)
                 }
                 let raw = try mlxDType(safetensors: t.dtype)
@@ -851,13 +825,13 @@ public final class BlockStreamer: @unchecked Sendable {
                             + "re-lay with a v2 kit for integrity verification")
                 }
                 let path = granuleDirs[setIndex].appendingPathComponent(granule.file).path
-                let fd = try GranuleIO.openRead(path)
+                let fd = try GranuleFileIO.openRead(path)
                 defer { close(fd) }
                 var hasher = SHA256()
                 var offset = 0
                 while offset < granule.bytes {
                     let n = min(bufBytes, granule.bytes - offset)
-                    try GranuleIO.preadFull(fd: fd, into: buf, count: n, offset: offset)
+                    try GranuleFileIO.preadFull(fd: fd, into: buf, count: n, offset: offset)
                     hasher.update(bufferPointer: UnsafeRawBufferPointer(start: buf, count: n))
                     offset += n
                 }
@@ -881,14 +855,14 @@ public final class BlockStreamer: @unchecked Sendable {
                 "no globals sidecar in set \(set) — v1 tree; load globals from the "
                     + "source checkpoint or re-lay with a v2 kit")
         }
-        let fd = try GranuleIO.openRead(
+        let fd = try GranuleFileIO.openRead(
             granuleDirs[set].appendingPathComponent(g.file).path, noCache: false)
         defer { close(fd) }
         var out: [(String, MLXArray)] = []
         for t in g.tensors {
             var bytes = Data(count: t.nbytes)
             try bytes.withUnsafeMutableBytes { raw in
-                try GranuleIO.preadFull(
+                try GranuleFileIO.preadFull(
                     fd: fd, into: raw.baseAddress!, count: t.nbytes, offset: t.offset)
             }
             let a = MLXArray(bytes, t.shape, dtype: try mlxDType(safetensors: t.dtype))

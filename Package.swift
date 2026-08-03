@@ -21,7 +21,13 @@ let package = Package(
         .macOS(.v26)
     ],
     products: [
-        .library(name: "BlockStreamKit", targets: ["BlockStreamKit"])
+        .library(name: "BlockStreamKit", targets: ["BlockStreamKit"]),
+        // The IO substrate WITHOUT the streamer — granule layout/manifest, raw
+        // F_NOCACHE file IO, the P-C alias seam, and the activation spill file
+        // (BLOCKSTREAM-EXPANSION-EVAL §1.3: consumers with activation state to
+        // spill — SeedVR2 VAE banks first — take this product alone; weights
+        // streaming consumers keep taking BlockStreamKit, which re-exports it).
+        .library(name: "GranuleIO", targets: ["GranuleIO"]),
     ],
     dependencies: [
         // Floor matches the fleet (mlx-engine-swift ≥0.27.0 floors mlx-swift at
@@ -31,11 +37,19 @@ let package = Package(
     ],
     targets: [
         .target(
-            name: "BlockStreamKit",
+            name: "GranuleIO",
             dependencies: [
                 .product(name: "MLX", package: "mlx-swift")
             ],
+            path: "Sources/GranuleIO"
+        ),
+        .target(
+            name: "BlockStreamKit",
+            dependencies: [
+                "GranuleIO",
+                .product(name: "MLX", package: "mlx-swift"),
+            ],
             path: "Sources/BlockStreamKit"
-        )
+        ),
     ]
 )
