@@ -30,9 +30,20 @@ semantics (expert switches, multi-stage gate thresholds).
   16 KiB-aligned file, written straight from unified memory and pread straight
   back into freshly materialized arrays. For ACTIVATION state that must leave
   memory and come back bit-identical (no gate, no slots, no fallback — those are
-  weight-streaming concepts). First customer: SeedVR2's VAE streaming-bank
-  eviction, whose safetensors round trip V12-B3 measured SERIALIZATION-bound
-  (~7× under raw disk bandwidth → +48% wall clock on the shipping video path).
-  Spill files are structurally validated (magic/version/table/range), NOT
-  hashed — manifest v2's per-file SHA-256 is for hosted trees read many times,
-  and hashing multi-GiB per-chunk spill traffic would hand the win back.
+  weight-streaming concepts). Spill files are structurally validated
+  (magic/version/table/range), NOT hashed — manifest v2's per-file SHA-256 is
+  for hosted trees read many times, not per-chunk multi-GiB spill traffic.
+
+  ⚠️ Measured caveat (2026-08-03, `probes/v12b3g_bank_granule_io.out`): the
+  first candidate customer — SeedVR2's VAE bank eviction — A/B'd this format
+  against its safetensors store through the shipping path and found the
+  COMPOSITE indifferent on a 128 GB host: the round trip was already at disk
+  rate, and V12-B3's "serialization-bound / +48%" decomposition did not
+  reproduce (in-regime eviction cost ≈+7%, the +48% was session drift). The
+  spill file is correct (bit-identical through two eviction boundaries at 40
+  tile positions, all refusal gates) and lives on that port's
+  `granule-bank-store` branch; the open case for it is memory-constrained
+  hosts, where a buffered-IO store floods the page cache with the spill
+  traffic and F_NOCACHE invariance should matter — unmeasured until a 16 GB
+  arm exists. Don't cite this product as a proven speedup; cite it as the
+  honest-IO spill substrate.

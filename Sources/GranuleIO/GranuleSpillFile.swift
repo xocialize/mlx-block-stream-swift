@@ -1,15 +1,20 @@
 // GranuleIO: the activation spill file — one tensor set as ONE contiguous
-// self-describing file (BLOCKSTREAM-EXPANSION-EVAL §1.3; SeedVR2's VAE
-// streaming banks are the first customer).
-//
-// Why this exists: V12-B3 measured bank eviction's +48% wall-clock cost and
-// decomposed it as SERIALIZATION-bound — 57 tensors per bank through
-// safetensors framing + host materialization ran the round trip ~7× below the
-// volume's raw bandwidth. This file is the "contiguous single-buffer bank
-// format" that receipt named as the obvious first move: a fixed 16-byte
+// self-describing file (BLOCKSTREAM-EXPANSION-EVAL §1.3): a fixed 16-byte
 // preamble + one JSON table + 16 KiB-aligned payloads, written straight from
 // each array's unified-memory backing and read back by pread-ing straight
 // into a freshly materialized array's backing (the streamer's P-C alias seam).
+//
+// ⚠️ History, honestly (probes/v12b3g_bank_granule_io.out, 2026-08-03): this
+// was built as the "contiguous single-buffer bank format" V12-B3 named after
+// decomposing SeedVR2's +48% bank-eviction cost as SERIALIZATION-bound. The
+// composite A/B through that port's shipping path FALSIFIED the decomposition:
+// on a 128 GB host the safetensors round trip already ran at disk rate, the
+// format changed wall clock by less than arm noise, and the +48% itself was
+// session drift (in-regime cost ≈+7%). What this format still buys, by
+// construction rather than by measurement: honest F_NOCACHE IO in both
+// directions — a buffered-IO store pushes the entire spill volume through the
+// page cache, which a memory-constrained host (the only kind that evicts)
+// cannot absorb. That regime is the open receipt.
 //
 // What it deliberately is NOT:
 //   - Not a granule tree: no manifest.json, no uniform-block requirement —
