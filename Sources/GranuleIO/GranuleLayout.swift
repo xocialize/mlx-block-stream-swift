@@ -152,6 +152,22 @@ public struct GranuleManifest: Codable, Sendable {
     /// the hashes instead of source-file provenance. nil on v1 trees (which
     /// keep loading globals from the checkpoint).
     public let globals: GranuleBlock?
+    /// Upstream repo the source checkpoint came from (e.g.
+    /// `"xocialize/ltx-2.3-mlx"`), and the revision pinned when it was laid out.
+    ///
+    /// Provenance-only — the streaming path never reads these. `sourceFile` +
+    /// `sourceSize` anchor a tree to a checkpoint on THIS disk; they cannot say
+    /// which published artifact that checkpoint was, so for a HOSTED tree the
+    /// chain back to upstream was previously inferential (match the byte size by
+    /// hand and hope). Recording it makes the chain machine-checkable.
+    ///
+    /// ⚠️ Optional, and the manifest version is deliberately NOT bumped: `load`
+    /// rejects `version > currentVersion`, so a bump would make every existing
+    /// pinned consumer refuse trees it can otherwise read perfectly. Absent on
+    /// trees laid out before this field existed; unknown JSON keys are ignored
+    /// by older loaders, so trees carrying it stay readable by them too.
+    public let sourceRepo: String?
+    public let sourceRevision: String?
 
     enum CodingKeys: String, CodingKey {
         case version
@@ -164,6 +180,8 @@ public struct GranuleManifest: Codable, Sendable {
         case blocks
         case globalKeys = "global_keys"
         case globals
+        case sourceRepo = "source_repo"
+        case sourceRevision = "source_revision"
     }
 
     public static let currentVersion = 2
@@ -297,6 +315,11 @@ public enum GranuleLayout {
     ///   - safetensors: source checkpoint (`transformer-distilled.safetensors`).
     ///   - outputDir: created if needed; receives `block_NNN.granule` + `manifest.json`.
     ///   - blockPrefix: parameter-path prefix that marks per-block tensors.
+    ///   - sourceRepo: upstream repo the checkpoint was published from (e.g.
+    ///     `"xocialize/ltx-2.3-mlx"`). Recorded for provenance only. Supply it
+    ///     whenever the tree may be HOSTED — `sourceFile`/`sourceSize` anchor to
+    ///     a local file and cannot identify the published artifact.
+    ///   - sourceRevision: the upstream revision pinned at layout time.
     ///   - progress: optional per-block callback (blockIndex, blockCount).
     @discardableResult
     public static func write(
@@ -304,6 +327,8 @@ public enum GranuleLayout {
         outputDir: URL,
         blockPrefix: String,
         orderRank: (String) -> Int = { _ in 0 },
+        sourceRepo: String? = nil,
+        sourceRevision: String? = nil,
         progress: ((Int, Int) -> Void)? = nil
     ) throws -> Result {
         let t0 = Date()
@@ -433,7 +458,9 @@ public enum GranuleLayout {
             streamedBytes: streamedBytes,
             blocks: blocks,
             globalKeys: globalKeys.sorted(),
-            globals: globalsBlock)
+            globals: globalsBlock,
+            sourceRepo: sourceRepo,
+            sourceRevision: sourceRevision)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         try encoder.encode(manifest).write(
