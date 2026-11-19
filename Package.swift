@@ -32,10 +32,10 @@ let package = Package(
     dependencies: [
         // Floor matches the fleet (mlx-engine-swift ≥0.27.0 floors mlx-swift at
         // ≥0.31.5; wan-core validates 0.31.4 via its own resolve). Ceiling admits
-        // 0.32.x — 0.32.2 carries the NAX split-K GEMM fix (mlx#3810) and is the
-        // floor of the next mlx-swift-lm — while still capping at the next
+        // 0.32.x (0.32.2 carries the NAX split-K GEMM fix, mlx#3810) and 0.33.x,
+        // which mlx-swift-lm 3.33.0 requires, while still capping at the next
         // unvalidated minor.
-        .package(url: "https://github.com/ml-explore/mlx-swift.git", "0.31.3" ..< "0.33.0")
+        .package(url: "https://github.com/ml-explore/mlx-swift.git", "0.31.3" ..< "0.34.0")
     ],
     targets: [
         .target(
